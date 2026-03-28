@@ -1,0 +1,14 @@
+# Cookies — nunca suba isso para o repositório
+cookies.txt
+*.cookies.txt
+transcricoes/cookies.txt
+
+# Transcrições geradas (opcional — remova se quiser versionar)
+transcricoes/
+
+# Ambiente virtual do uv
+.venv/
+
+# Cache Python
+__pycache__/
+*.pyc

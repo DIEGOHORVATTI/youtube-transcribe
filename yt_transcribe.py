@@ -19,6 +19,7 @@ Exemplos:
 """
 
 import argparse
+import http.cookiejar
 import json
 import re
 import subprocess
@@ -42,27 +43,61 @@ def sanitizar_nome(nome: str, max_len: int = 80) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", nome)[:max_len]
 
 
+# ── Cookies ──────────────────────────────────────────────────────────────────
+
+NAVEGADORES_SUPORTADOS = ["chrome", "firefox", "brave", "edge", "safari", "opera", "chromium"]
+
+def exportar_cookies_do_navegador(navegador: str, destino: Path) -> Path:
+    """Usa yt-dlp para exportar cookies do navegador para um arquivo Netscape."""
+    print(f"🍪 Exportando cookies do {navegador}...")
+    arquivo = destino / "cookies.txt"
+    try:
+        subprocess.run(
+            ["yt-dlp", f"--cookies-from-browser", navegador,
+             "--cookies", str(arquivo),
+             "--flat-playlist", "--print", "NA",
+             "--no-warnings",
+             "https://www.youtube.com"],
+            capture_output=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Falha ao exportar cookies do {navegador}: {e.stderr.decode().strip()}")
+        sys.exit(1)
+    print(f"  ✅ Cookies salvos em: {arquivo}\n")
+    return arquivo
+
+
+def carregar_cookie_jar(caminho: Path) -> http.cookiejar.MozillaCookieJar:
+    """Carrega um arquivo de cookies no formato Netscape/Mozilla."""
+    jar = http.cookiejar.MozillaCookieJar()
+    try:
+        jar.load(str(caminho), ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        print(f"❌ Não foi possível carregar o arquivo de cookies: {e}")
+        sys.exit(1)
+    return jar
+
+
 # ── Obtenção de vídeos ───────────────────────────────────────────────────────
 
-def obter_videos(url: str) -> list[dict]:
+def obter_videos(url: str, cookies: Path | None = None) -> list[dict]:
     """
     Usa yt-dlp para listar todos os vídeos de uma URL
     (funciona com playlist, canal ou vídeo único).
     """
     print(f"🔍 Buscando vídeos em: {url}")
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--print", "%(id)s|||%(title)s",
+        "--no-warnings",
+    ]
+    if cookies:
+        cmd += ["--cookies", str(cookies)]
+    cmd.append(url)
+
     try:
-        resultado = subprocess.run(
-            [
-                "yt-dlp",
-                "--flat-playlist",
-                "--print", "%(id)s|||%(title)s",
-                "--no-warnings",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        resultado = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except FileNotFoundError:
         print("❌ yt-dlp não encontrado. Execute o script com:  uv run yt_transcribe.py")
         sys.exit(1)
@@ -86,7 +121,8 @@ def obter_videos(url: str) -> list[dict]:
 
 # ── Transcrição ──────────────────────────────────────────────────────────────
 
-def transcrever(video_id: str, idiomas: list[str]) -> str | None:
+def transcrever(video_id: str, idiomas: list[str],
+                cookie_jar: http.cookiejar.MozillaCookieJar | None = None) -> str | None:
     """Busca a transcrição de um vídeo. Retorna texto limpo ou None."""
     from youtube_transcript_api import (
         NoTranscriptFound,
@@ -96,7 +132,7 @@ def transcrever(video_id: str, idiomas: list[str]) -> str | None:
     )
 
     try:
-        api = YouTubeTranscriptApi()
+        api = YouTubeTranscriptApi(cookie_jar=cookie_jar)
         transcript = api.fetch(video_id, languages=idiomas)
         trechos = [limpar_texto(s.text) for s in transcript]
         return " ".join(t for t in trechos if t)
@@ -169,7 +205,8 @@ exemplos:
   ./yt_transcribe.py "https://youtube.com/playlist?list=PL..."
   ./yt_transcribe.py "https://youtu.be/VIDEO_ID" -o ./saida
   ./yt_transcribe.py "https://youtube.com/playlist?list=PL..." -l pt en -d 3
-  ./yt_transcribe.py "https://youtube.com/playlist?list=PL..." --sem-arquivo-completo
+  ./yt_transcribe.py "https://youtube.com/playlist?list=PL..." --cookies-do-navegador chrome
+  ./yt_transcribe.py "https://youtube.com/playlist?list=PL..." --cookies ./cookies.txt
         """,
     )
 
@@ -196,6 +233,17 @@ exemplos:
         default=2.0,
         metavar="SEG",
         help="Segundos de espera entre vídeos para evitar bloqueio (padrão: 2)",
+    )
+    parser.add_argument(
+        "--cookies",
+        metavar="ARQUIVO",
+        help="Caminho para arquivo de cookies no formato Netscape/txt (exportado pelo browser ou yt-dlp)",
+    )
+    parser.add_argument(
+        "--cookies-do-navegador",
+        metavar="NAVEGADOR",
+        choices=NAVEGADORES_SUPORTADOS,
+        help=f"Exporta cookies diretamente do navegador. Opções: {', '.join(NAVEGADORES_SUPORTADOS)}",
     )
     parser.add_argument(
         "--sem-arquivo-completo",
@@ -226,7 +274,24 @@ def main() -> None:
     saida_dir = Path(args.saida)
     saida_dir.mkdir(parents=True, exist_ok=True)
 
-    videos = obter_videos(args.url)
+    # ── Resolve cookies ──────────────────────────────────────────────────────
+    cookie_path: Path | None = None
+    cookie_jar: http.cookiejar.MozillaCookieJar | None = None
+
+    if args.cookies_do_navegador:
+        cookie_path = exportar_cookies_do_navegador(args.cookies_do_navegador, saida_dir)
+    elif args.cookies:
+        cookie_path = Path(args.cookies)
+        if not cookie_path.exists():
+            print(f"❌ Arquivo de cookies não encontrado: {cookie_path}")
+            sys.exit(1)
+
+    if cookie_path:
+        cookie_jar = carregar_cookie_jar(cookie_path)
+        print(f"🍪 Usando cookies de: {cookie_path}\n")
+
+    # ── Busca e transcrição ──────────────────────────────────────────────────
+    videos = obter_videos(args.url, cookies=cookie_path)
     resultados: list[dict] = []
     erros: list[dict] = []
 
@@ -237,7 +302,7 @@ def main() -> None:
         print(f"[{i:02d}/{len(videos)}] {titulo}")
         print(f"         https://youtu.be/{vid_id}")
 
-        texto = transcrever(vid_id, args.idiomas)
+        texto = transcrever(vid_id, args.idiomas, cookie_jar=cookie_jar)
 
         if texto:
             arquivo = salvar_individual(saida_dir, titulo, vid_id, texto, i)
